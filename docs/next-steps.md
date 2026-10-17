@@ -5,7 +5,7 @@ architecture.md or an ADR.
 
 ## Next
 
-1. Define the project's purpose and first feature in a spec under
-   `docs/specs/` (`/devflow:spec`).
+1. Review the spec `docs/specs/2026-10-17-point-history.md` (draft);
+   once approved, implement it with `/devflow:implement`.
 
 ## Watch out for
