@@ -11,6 +11,7 @@ compile:
 
 checkdoc:
 	$(EMACS) -Q --batch -L . \
+	  --eval '(setq checkdoc-verb-check-experimental-flag t)' \
 	  --eval '(setq checkdoc-create-error-function (lambda (text start end &optional unfixable) (error "checkdoc: %s (at %s)" text start)))' \
 	  --eval '(checkdoc-file "point-history.el")'
 

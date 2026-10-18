@@ -736,7 +736,7 @@ return non-nil."
 
 (defun point-history--navigate (direction label end-message
                                           &optional predicate adjust)
-  "Move to the next entry in DIRECTION for which PREDICATE holds.
+  "Move to the next entry in DIRECTION accepted by PREDICATE.
 DIRECTION, PREDICATE: see `point-history--search'.  Apply the return
 point rule first (`point-history--apply-return-point'); if no entry is
 found, the return entry is removed again.  If ADJUST is
@@ -796,7 +796,7 @@ Entries of killed buffers are compared by file."
       (not (point-history--entry-in-buffer-p entry buffer)))))
 
 (defun point-history--newest-of-run (index)
-  "Return the index of the newest entry of the run that contains INDEX.
+  "Return the index of the newest entry of the run containing INDEX.
 A run is a series of adjacent entries of the same buffer."
   (let ((entry (nth index point-history--entries)))
     (while (and (> index 0)
@@ -882,7 +882,7 @@ a killed buffer the line number is \"?\" and the text is empty."
               (or (point-history--entry-file entry) "killed buffer")))))
 
 (defun point-history--completion-table (candidates)
-  "Return a completion table for CANDIDATES that keeps their order."
+  "Return a completion table for CANDIDATES in their given order."
   (lambda (string predicate action)
     (if (eq action 'metadata)
         '(metadata (display-sort-function . identity)
