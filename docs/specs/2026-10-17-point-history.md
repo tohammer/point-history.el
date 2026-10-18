@@ -1,6 +1,6 @@
 # point-history: back/forward navigation by activity
 
-Status: draft
+Status: approved
 Date: 2026-10-17
 
 ## Purpose
@@ -233,7 +233,7 @@ Manual checks in a real Emacs session with the suggested bindings:
 
 ## Tasks
 
-- [ ] 1. Package skeleton on a branch:
+- [x] 1. Package skeleton on a branch:
   header, empty `point-history-mode`, user options, Makefile, CI
   workflow, `.gitignore`, LICENSE, README skeleton with AI Disclaimer,
   one smoke test. *Done when* `make all` passes locally with Emacs 31
