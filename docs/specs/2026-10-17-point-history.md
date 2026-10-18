@@ -177,6 +177,30 @@ forward, `M-S-left` back-file, `M-S-right` forward-file). No private
 information (see `CLAUDE.md`).
 
 
+### Decisions made during implementation
+
+Behaviour the spec left open or that review showed needed care
+(implemented and tested):
+
+- Edits are detected with `buffer-chars-modified-tick`, so
+  text-property changes are not edits.
+- Pre/post-command hooks do nothing while the minibuffer is active
+  ([ADR 0002](../decisions/0002-hooks-inactive-in-minibuffer.md)).
+- A return entry is only inserted in a recordable buffer; back from a
+  non-recordable buffer lands on the current entry. In a full history,
+  no return entry is inserted when it would push out the current entry.
+- A navigation command that finds no target changes nothing: the
+  return entry is removed again, and forward at index 0 inserts none.
+  Such a command does not count as navigation for the return-point rule.
+- Entries of a killed buffer are reattached when its file is opened
+  again (`find-file-hook`), not only when navigating to them.
+- A buffer shown because the previous one was killed is not a visit.
+- Near checks and navigation widen; a target outside a narrowing widens
+  the buffer.
+- The remembered window start is restored with NOFORCE.
+- The removal message names the killed buffer; list candidates of
+  killed buffers show the file name and `?` as line number.
+
 ## Error handling
 
 - Entry buffer killed: handled as described under Navigation (reopen or
