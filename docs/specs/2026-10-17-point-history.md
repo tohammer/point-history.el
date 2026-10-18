@@ -242,7 +242,7 @@ Manual checks in a real Emacs session with the suggested bindings:
   copy and idle activity, rules 1–3, size limit, error-catching hooks,
   mode on/off. *Done when* the recording tests listed under Testing pass
   in `make all`.
-- [ ] 3. Navigation: back/forward, return point, navigating state, window
+- [x] 3. Navigation: back/forward, return point, navigating state, window
   start, killed buffers and missing files, messages. *Done when* the
   navigation tests pass in `make all`.
 - [ ] 4. File visits: placeholders, replacement by first activity, undo
