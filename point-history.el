@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 Tobias Hammer
 
 ;; Author: Tobias Hammer <tohammer@users.noreply.github.com>
-;; Version: 0.1
+;; Version: 0.2
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience
 ;; URL: https://github.com/tohammer/point-history.el

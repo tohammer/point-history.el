@@ -16,7 +16,7 @@ a browser. Quick jumps do not fill the history, so it stays short.
 
 ## Status
 
-Version 0.1, early. The history is kept in memory only.
+Version 0.2, early. The history is kept in memory only.
 
 | Emacs | Status |
 |---|---|
