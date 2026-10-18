@@ -252,7 +252,7 @@ Manual checks in a real Emacs session with the suggested bindings:
 - [ ] 6. `point-history-list` and `point-history-remember`. *Done when*
   tests for selecting from the list (by stubbing `completing-read`) and
   for remember pass in `make all`.
-- [ ] 7. README: behaviour, options, commands, suggested bindings,
+- [x] 7. README: behaviour, options, commands, suggested bindings,
   installation. *Done when* every option and command in the code is in
   the README and the README contains no private information.
 - [ ] 8. Publish: after the user confirms, create the public GitHub repo
