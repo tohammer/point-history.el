@@ -1300,5 +1300,318 @@ position; the dropped forward history is not restored."
     (point-history-test--move-to 100)
     (should (null point-history--entries))))
 
+;;;; Filtered navigation
+
+(defun point-history-test--cmd (command)
+  "Run COMMAND, a symbol, and return its messages."
+  (point-history-test--run command))
+
+(defun point-history-test--three-files ()
+  "Record seven places in three files; end in c.txt at line 50.
+The history, newest first, is c50 c10 b90 b50 b10 a50 a10.  Return
+the buffers a, b and c."
+  (let ((a (point-history-test--file-buffer "a.txt")))
+    (point-history-test--edit-at 10)
+    (point-history-test--edit-at 50)
+    (let ((b (point-history-test--file-buffer "b.txt")))
+      (point-history-test--edit-at 10)
+      (point-history-test--edit-at 50)
+      (point-history-test--edit-at 90)
+      (let ((c (point-history-test--file-buffer "c.txt")))
+        (point-history-test--edit-at 10)
+        (point-history-test--edit-at 50)
+        (list a b c)))))
+
+(ert-deftest point-history-test-filter-commands-marked ()
+  "The filtered and list commands are navigation commands."
+  (dolist (command '(point-history-back-file point-history-forward-file
+                     point-history-back-in-file point-history-forward-in-file
+                     point-history-list))
+    (should (commandp command))
+    (should (point-history--navigation-command-p command))))
+
+(ert-deftest point-history-test-by-file-and-in-file ()
+  "By-file and in-file commands find the right targets and mix with back/forward."
+  (point-history-test--with-fixture
+    (point-history-test--three-files)
+    (should (equal (point-history-test--places)
+                   '(("c.txt" . 50) ("c.txt" . 10) ("b.txt" . 90)
+                     ("b.txt" . 50) ("b.txt" . 10) ("a.txt" . 50)
+                     ("a.txt" . 10))))
+    ;; The next older run is b: land on its newest entry.
+    (should (equal (point-history-test--cmd 'point-history-back-file)
+                   '("Back 3/7")))
+    (should (equal (point-history-test--here) '("b.txt" . 90)))
+    (should (equal (point-history-test--cmd 'point-history-back-in-file)
+                   '("Back 4/7")))
+    (should (equal (point-history-test--here) '("b.txt" . 50)))
+    ;; Plain back shares the index.
+    (should (equal (point-history-test--back) '("Back 5/7")))
+    (should (equal (point-history-test--here) '("b.txt" . 10)))
+    (should (equal (point-history-test--cmd 'point-history-back-in-file)
+                   '("No earlier place in this file")))
+    (should (equal (point-history-test--here) '("b.txt" . 10)))
+    (should (= point-history--index 4))
+    (should (equal (point-history-test--cmd 'point-history-back-file)
+                   '("Back 6/7")))
+    (should (equal (point-history-test--here) '("a.txt" . 50)))
+    (should (equal (point-history-test--cmd 'point-history-back-in-file)
+                   '("Back 7/7")))
+    (should (equal (point-history-test--here) '("a.txt" . 10)))
+    (should (equal (point-history-test--cmd 'point-history-back-file)
+                   '("No earlier file")))
+    (should (= point-history--index 6))
+    (should (equal (point-history-test--cmd 'point-history-forward-in-file)
+                   '("Forward 6/7")))
+    (should (equal (point-history-test--here) '("a.txt" . 50)))
+    (should (equal (point-history-test--cmd 'point-history-forward-in-file)
+                   '("No later place in this file")))
+    ;; The next newer run is b: land on its newest entry.
+    (should (equal (point-history-test--cmd 'point-history-forward-file)
+                   '("Forward 3/7")))
+    (should (equal (point-history-test--here) '("b.txt" . 90)))
+    (should (equal (point-history-test--cmd 'point-history-forward-in-file)
+                   '("No later place in this file")))
+    (should (equal (point-history-test--cmd 'point-history-forward-file)
+                   '("Forward 1/7")))
+    (should (equal (point-history-test--here) '("c.txt" . 50)))
+    (should (equal (point-history-test--cmd 'point-history-forward-file)
+                   '("No later file")))
+    (should (equal (point-history-test--cmd 'point-history-forward-in-file)
+                   '("No later place in this file")))
+    (should (= point-history--index 0))
+    (should (equal (length point-history--entries) 7))))
+
+(ert-deftest point-history-test-forward-file-lands-on-newest-of-run ()
+  "Forward by file from the oldest entry lands on the newest entry of each run."
+  (point-history-test--with-fixture
+    (point-history-test--three-files)
+    (point-history-test--cmd 'point-history-back-file)
+    (point-history-test--cmd 'point-history-back-file)
+    (should (equal (point-history-test--here) '("a.txt" . 50)))
+    (point-history-test--cmd 'point-history-back-in-file)
+    (should (= point-history--index 6))
+    (point-history-test--cmd 'point-history-forward-file)
+    (should (= point-history--index 2))
+    (should (equal (point-history-test--here) '("b.txt" . 90)))))
+
+(ert-deftest point-history-test-by-file-return-point ()
+  "The return entry in the current buffer is skipped by the by-file commands."
+  (point-history-test--with-fixture
+    (point-history-test--three-files)
+    (point-history-test--move-to 150)
+    (should (equal (point-history-test--cmd 'point-history-back-file)
+                   '("Back 4/8")))
+    (should (equal (point-history-test--here) '("b.txt" . 90)))
+    (should (equal (point-history-test--kinds)
+                   '(return activity activity activity activity activity
+                            activity activity)))
+    (should (equal (point-history-test--cmd 'point-history-forward-file)
+                   '("Forward 1/8")))
+    (should (equal (point-history-test--here) '("c.txt" . 150)))))
+
+(ert-deftest point-history-test-in-file-return-point ()
+  "In-file navigation from a place away from the entry uses the return entry."
+  (point-history-test--with-fixture
+    (point-history-test--three-files)
+    (point-history-test--move-to 150)
+    (should (equal (point-history-test--cmd 'point-history-back-in-file)
+                   '("Back 2/8")))
+    (should (equal (point-history-test--here) '("c.txt" . 50)))
+    (should (equal (point-history-test--cmd 'point-history-forward-in-file)
+                   '("Forward 1/8")))
+    (should (equal (point-history-test--here) '("c.txt" . 150)))))
+
+(ert-deftest point-history-test-by-file-killed-buffer-compared-by-file ()
+  "An entry of a killed buffer is compared with the current buffer by file."
+  (point-history-test--with-fixture
+    (point-history-test--with-mode
+      (point-history-test--file-buffer "a.txt")
+      (point-history-test--edit-at 10)
+      (let ((b (point-history-test--file-buffer "b.txt")))
+        (point-history-test--edit-at 10)
+        (point-history-test--edit-at 50)
+        (save-buffer)
+        (kill-buffer b))
+      (let ((b2 (find-file-noselect (point-history-test--file "b.txt"))))
+        (push b2 point-history-test--buffers)
+        (switch-to-buffer b2)
+        (point-history-test--goto-line 150)
+        (let ((b50 (nth 0 point-history--entries))
+              (b10 (nth 1 point-history--entries)))
+          (should-not (marker-buffer (point-history--entry-marker b50)))
+          ;; Both dead entries are in the current file: skip, reach a10.
+          (should (equal (point-history-test--cmd 'point-history-back-file)
+                         '("Back 4/4")))
+          (should (equal (point-history-test--here) '("a.txt" . 10)))
+          (should-not (marker-buffer (point-history--entry-marker b50)))
+          (should-not (marker-buffer (point-history--entry-marker b10)))
+          ;; In-file from a: the dead entries belong to another file.
+          (should (equal (point-history-test--cmd 'point-history-forward-in-file)
+                         '("No later place in this file")))
+          (should-not (marker-buffer (point-history--entry-marker b50))))))))
+
+(ert-deftest point-history-test-in-file-killed-buffer-reopened ()
+  "In-file navigation finds the dead entries of the current file and reopens them."
+  (point-history-test--with-fixture
+    (point-history-test--with-mode
+      (point-history-test--file-buffer "a.txt")
+      (point-history-test--edit-at 10)
+      (let ((b (point-history-test--file-buffer "b.txt")))
+        (point-history-test--edit-at 10)
+        (point-history-test--edit-at 50)
+        (save-buffer)
+        (kill-buffer b))
+      (let ((b2 (find-file-noselect (point-history-test--file "b.txt"))))
+        (push b2 point-history-test--buffers)
+        (switch-to-buffer b2)
+        (point-history-test--goto-line 150)
+        (should (equal (point-history-test--cmd 'point-history-back-in-file)
+                       '("Back 2/4")))
+        (should (eq (current-buffer) b2))
+        (should (equal (point-history-test--here) '("b.txt" . 50)))))))
+
+;;;; List and remember
+
+(defun point-history-test--complete (index)
+  "Run `point-history-list' choosing the candidate at 0-based INDEX.
+Return (MESSAGES CANDIDATES METADATA)."
+  (let ((candidates nil)
+        (metadata nil))
+    (let ((messages
+           (cl-letf (((symbol-function 'completing-read)
+                      (lambda (_prompt table &optional _predicate require-match
+                                       &rest _)
+                        (should require-match)
+                        (setq metadata (completion-metadata "" table nil)
+                              candidates (all-completions "" table))
+                        (nth index candidates))))
+             (point-history-test--run 'point-history-list))))
+      (list messages candidates metadata))))
+
+(ert-deftest point-history-test-list-empty ()
+  "The list with an empty history says so and does not ask."
+  (point-history-test--with-fixture
+    (point-history-test--file-buffer "a.txt")
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _) (error "Should not ask"))))
+      (should (equal (point-history-test--run 'point-history-list)
+                     '("No places recorded yet"))))))
+
+(ert-deftest point-history-test-list-candidates-and-selection ()
+  "The list is in history order with unique candidates; selecting jumps there."
+  (point-history-test--with-fixture
+    (point-history-test--three-files)
+    (let* ((result (point-history-test--complete 4))
+           (candidates (nth 1 result))
+           (metadata (nth 2 result)))
+      (should (equal (nth 0 result) '("Go to 5/7")))
+      (should (= (length candidates) 7))
+      (should (= (length (delete-dups (copy-sequence candidates))) 7))
+      (should (eq (completion-metadata-get metadata 'display-sort-function)
+                  #'identity))
+      (should (eq (completion-metadata-get metadata 'cycle-sort-function)
+                  #'identity))
+      (let ((expected '("c.txt" "c.txt" "b.txt" "b.txt" "b.txt" "a.txt" "a.txt"))
+            (lines '(50 10 90 50 10 50 10))
+            (i 0))
+        (dolist (candidate candidates)
+          (should (string-match
+                   (format "\\`%d %s:%d: xline %d\\'" (1+ i) (nth i expected)
+                           (nth i lines) (nth i lines))
+                   candidate))
+          (setq i (1+ i))))
+      (should (equal (point-history-test--here) '("b.txt" . 10)))
+      (should (= point-history--index 4))
+      (should point-history--navigating)
+      (should (eq (point-history--current-entry)
+                  (nth 4 point-history--entries))))))
+
+(ert-deftest point-history-test-list-return-point ()
+  "Selecting from a place away from the entry still lands on the chosen entry."
+  (point-history-test--with-fixture
+    (point-history-test--file-buffer "a.txt")
+    (point-history-test--edit-at 10)
+    (point-history-test--edit-at 50)
+    (point-history-test--move-to 150)
+    (let ((chosen (nth 1 point-history--entries)))
+      (should (equal (car (point-history-test--complete 1)) '("Go to 3/3")))
+      (should (equal (point-history-test--here) '("a.txt" . 10)))
+      (should (eq (point-history--current-entry) chosen))
+      (should (equal (point-history-test--kinds) '(return activity activity)))
+      (should (equal (point-history-test--lines) '(150 50 10))))
+    ;; Again from afar: the return entry is inserted before the current
+    ;; entry (a10), which shifts the chosen entry's index.
+    (point-history-test--move-to 170)
+    (should (equal (car (point-history-test--complete 2)) '("Go to 4/4")))
+    (should (equal (point-history-test--here) '("a.txt" . 10)))
+    (should (= point-history--index 3))))
+
+(ert-deftest point-history-test-list-killed-buffer-candidate ()
+  "An entry of a killed buffer is listed by file name and can be selected."
+  (point-history-test--with-fixture
+    (point-history-test--with-mode
+      (let ((a (point-history-test--file-buffer "a.txt")))
+        (point-history-test--edit-at 20)
+        (save-buffer)
+        (point-history-test--file-buffer "b.txt")
+        (point-history-test--edit-at 5)
+        (kill-buffer a)
+        (let ((result (point-history-test--complete 1)))
+          (should (string-match
+                   (format "\\`2 %s:\\?: \\'"
+                           (regexp-quote (point-history-test--file "a.txt")))
+                   (nth 1 (nth 1 result))))
+          (should (equal (nth 0 result) '("Go to 2/2")))
+          (should (equal (point-history-test--here) '("a.txt" . 20))))))))
+
+(ert-deftest point-history-test-remember-not-navigation ()
+  "`point-history-remember' is a command but not a navigation command."
+  (should (commandp 'point-history-remember))
+  (should-not (point-history--navigation-command-p 'point-history-remember)))
+
+(ert-deftest point-history-test-remember-non-file-buffer ()
+  "Remember records in a buffer that visits no file, whatever the options say."
+  (point-history-test--with-fixture
+    (point-history-test--plain-buffer "*point-history-test*")
+    (should point-history-file-buffers-only)
+    (should (equal (point-history-test--run 'point-history-remember)
+                   '("Place remembered")))
+    (should (= (length point-history--entries) 1))
+    (should (eq (point-history--entry-kind (car point-history--entries))
+                'activity))
+    (let ((point-history-message nil))
+      (should (null (point-history-test--run 'point-history-remember))))))
+
+(ert-deftest point-history-test-remember-ignored-mode ()
+  "Remember records in a buffer whose mode is ignored."
+  (point-history-test--with-fixture
+    (point-history-test--file-buffer "a.txt")
+    (special-mode)
+    (point-history-test--run 'point-history-remember)
+    (should (= (length point-history--entries) 1))))
+
+(ert-deftest point-history-test-remember-rules ()
+  "Remember applies rule 1 near an entry and rule 3 elsewhere."
+  (point-history-test--with-fixture
+    (point-history-test--file-buffer "a.txt")
+    (point-history-test--edit-at 10)
+    (let ((entry (car point-history--entries)))
+      (point-history-test--move-to 14)
+      (point-history-test--run 'point-history-remember)
+      (should (equal (point-history-test--lines) '(14)))
+      (should (eq (car point-history--entries) entry))
+      (point-history-test--move-to 100)
+      (point-history-test--run 'point-history-remember)
+      (should (equal (point-history-test--lines) '(100 14))))))
+
+(ert-deftest point-history-test-remember-not-in-minibuffer ()
+  "Remember signals a user error in a minibuffer and records nothing."
+  (point-history-test--with-fixture
+    (point-history-test--file-buffer "a.txt")
+    (cl-letf (((symbol-function 'minibufferp) (lambda (&rest _) t)))
+      (should-error (point-history-remember) :type 'user-error))
+    (should (null point-history--entries))))
+
 (provide 'point-history-test)
 ;;; point-history-test.el ends here

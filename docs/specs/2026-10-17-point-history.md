@@ -247,9 +247,9 @@ Manual checks in a real Emacs session with the suggested bindings:
   navigation tests pass in `make all`.
 - [x] 4. File visits: placeholders, replacement by first activity, undo
   on short stay. *Done when* the file-visit tests pass in `make all`.
-- [ ] 5. Filtered navigation: back/forward by file and within file.
+- [x] 5. Filtered navigation: back/forward by file and within file.
   *Done when* the by-file and in-file tests pass in `make all`.
-- [ ] 6. `point-history-list` and `point-history-remember`. *Done when*
+- [x] 6. `point-history-list` and `point-history-remember`. *Done when*
   tests for selecting from the list (by stubbing `completing-read`) and
   for remember pass in `make all`.
 - [x] 7. README: behaviour, options, commands, suggested bindings,

@@ -34,6 +34,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'subr-x)
 
 (defgroup point-history nil
   "Back/forward navigation by activity."
@@ -667,13 +668,15 @@ return non-nil."
         (message "%s %d/%d" label (1+ index) (length point-history--entries)))
       t)))
 
-(defun point-history--navigate (direction label end-message &optional predicate)
+(defun point-history--navigate (direction label end-message
+                                          &optional predicate adjust)
   "Move to the next entry in DIRECTION for which PREDICATE holds.
 DIRECTION, PREDICATE: see `point-history--search'.  Apply the return
-point rule first (`point-history--apply-return-point').  LABEL is
-passed to `point-history--goto-index'; END-MESSAGE is shown if there
-is no such entry.  Going newer from index 0 shows END-MESSAGE
-without inserting a return entry."
+point rule first (`point-history--apply-return-point').  If ADJUST is
+non-nil, call it with the index found and move to the index it
+returns instead.  LABEL is passed to `point-history--goto-index';
+END-MESSAGE is shown if there is no such entry.  Going newer from
+index 0 shows END-MESSAGE without inserting a return entry."
   (cond
    ((null point-history--entries)
     (message "No places recorded yet"))
@@ -685,8 +688,53 @@ without inserting a return entry."
                      (1- point-history--index)
                    point-history--index))
            (index (point-history--search direction predicate from)))
+      (when (and index adjust)
+        (setq index (funcall adjust index)))
       (unless (and index (point-history--goto-index index label))
         (message "%s" end-message))))))
+
+;;;; Filters
+
+(defun point-history--entry-in-buffer-p (entry buffer)
+  "Return non-nil if ENTRY belongs to BUFFER.
+That is the case if its marker is in BUFFER or, when its buffer was
+killed, if its file is the file BUFFER visits."
+  (let ((mb (marker-buffer (point-history--entry-marker entry))))
+    (if mb
+        (eq mb buffer)
+      (let ((file (buffer-file-name buffer)))
+        (and file (equal file (point-history--entry-file entry)))))))
+
+(defun point-history--same-buffer-p (a b)
+  "Return non-nil if the entries A and B belong to the same buffer.
+Entries of killed buffers are compared by file."
+  (let ((ma (marker-buffer (point-history--entry-marker a)))
+        (mb (marker-buffer (point-history--entry-marker b))))
+    (if (and ma mb)
+        (eq ma mb)
+      (let ((file (point-history--entry-file a)))
+        (and file (equal file (point-history--entry-file b)))))))
+
+(defun point-history--this-buffer-predicate ()
+  "Return a predicate that accepts entries of the current buffer."
+  (let ((buffer (current-buffer)))
+    (lambda (entry) (point-history--entry-in-buffer-p entry buffer))))
+
+(defun point-history--other-buffer-predicate ()
+  "Return a predicate that accepts entries not of the current buffer."
+  (let ((buffer (current-buffer)))
+    (lambda (entry)
+      (not (point-history--entry-in-buffer-p entry buffer)))))
+
+(defun point-history--newest-of-run (index)
+  "Return the index of the newest entry of the run that contains INDEX.
+A run is a series of adjacent entries of the same buffer."
+  (let ((entry (nth index point-history--entries)))
+    (while (and (> index 0)
+                (point-history--same-buffer-p
+                 entry (nth (1- index) point-history--entries)))
+      (setq index (1- index)))
+    index))
 
 ;;;###autoload
 (defun point-history-back ()
@@ -703,6 +751,112 @@ remembered, so that `point-history-forward' comes back to it."
   (interactive)
   (point-history--navigate -1 "Forward" "At newest place"))
 (put 'point-history-forward 'point-history-navigation t)
+
+;;;###autoload
+(defun point-history-back-file ()
+  "Go back to the newest place of the next older file in the history.
+Places in the current buffer are skipped."
+  (interactive)
+  (point-history--navigate 1 "Back" "No earlier file"
+                           (point-history--other-buffer-predicate)))
+(put 'point-history-back-file 'point-history-navigation t)
+
+;;;###autoload
+(defun point-history-forward-file ()
+  "Go forward to the newest place of the next newer file in the history.
+Places in the current buffer are skipped."
+  (interactive)
+  (point-history--navigate -1 "Forward" "No later file"
+                           (point-history--other-buffer-predicate)
+                           #'point-history--newest-of-run))
+(put 'point-history-forward-file 'point-history-navigation t)
+
+;;;###autoload
+(defun point-history-back-in-file ()
+  "Go back to the next older place in the current buffer."
+  (interactive)
+  (point-history--navigate 1 "Back" "No earlier place in this file"
+                           (point-history--this-buffer-predicate)))
+(put 'point-history-back-in-file 'point-history-navigation t)
+
+;;;###autoload
+(defun point-history-forward-in-file ()
+  "Go forward to the next newer place in the current buffer."
+  (interactive)
+  (point-history--navigate -1 "Forward" "No later place in this file"
+                           (point-history--this-buffer-predicate)))
+(put 'point-history-forward-in-file 'point-history-navigation t)
+
+;;;; List and remember
+
+(defun point-history--candidate (entry position)
+  "Return the completion candidate for ENTRY at 1-based POSITION.
+It shows the position, the buffer name (the file name if the buffer
+was killed), the line number and the trimmed text of the line.  For
+a killed buffer the line number is \"?\" and the text is empty."
+  (let* ((marker (point-history--entry-marker entry))
+         (buffer (marker-buffer marker)))
+    (if buffer
+        (with-current-buffer buffer
+          (save-excursion
+            (save-restriction
+              (widen)
+              (goto-char marker)
+              (format "%d %s:%d: %s" position (buffer-name)
+                      (line-number-at-pos nil t)
+                      (truncate-string-to-width
+                       (string-trim (buffer-substring-no-properties
+                                     (line-beginning-position)
+                                     (line-end-position)))
+                       80)))))
+      (format "%d %s:?: " position
+              (or (point-history--entry-file entry) "killed buffer")))))
+
+(defun point-history--completion-table (candidates)
+  "Return a completion table for CANDIDATES that keeps their order."
+  (lambda (string predicate action)
+    (if (eq action 'metadata)
+        '(metadata (display-sort-function . identity)
+                   (cycle-sort-function . identity))
+      (complete-with-action action candidates string predicate))))
+
+;;;###autoload
+(defun point-history-list ()
+  "Choose a place from the point history and go to it.
+The places are listed in history order, newest first."
+  (interactive)
+  (if (null point-history--entries)
+      (message "No places recorded yet")
+    (let* ((position 0)
+           (alist (mapcar (lambda (entry)
+                            (setq position (1+ position))
+                            (cons (point-history--candidate entry position)
+                                  entry))
+                          point-history--entries))
+           (choice (completing-read
+                    "Place: "
+                    (point-history--completion-table (mapcar #'car alist))
+                    nil t))
+           (entry (cdr (assoc choice alist))))
+      (when entry
+        (point-history--apply-return-point)
+        (let ((index (cl-position entry point-history--entries)))
+          (unless (and index (point-history--goto-index index "Go to"))
+            (message "Place no longer in the history")))))))
+(put 'point-history-list 'point-history-navigation t)
+
+;;;###autoload
+(defun point-history-remember ()
+  "Record point as a place in the history now.
+This works in any buffer except a minibuffer, whatever
+`point-history-file-buffers-only' and `point-history-ignored-modes'
+say, and does not wait for idle time."
+  (interactive)
+  (when (minibufferp)
+    (user-error "Cannot remember a place in the minibuffer"))
+  (point-history--activity 'activity)
+  (when point-history-message
+    (message "Place remembered")))
 
 (defvar point-history--timer nil
   "The idle timer that records reading, or nil.")
