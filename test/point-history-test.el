@@ -68,6 +68,10 @@ Buffers and files created by the helpers are removed afterwards."
          (point-history--last-error nil)
          (point-history--pre-buffer nil)
          (point-history--pre-tick nil)
+         (point-history--pre-window-buffer nil)
+         (point-history--pending-visit nil)
+         (point-history-record-file-visits t)
+         (point-history-visit-min-stay 1)
          (point-history-size 100)
          (point-history-distance 10)
          (point-history-activity-commands '(kill-ring-save))
@@ -201,7 +205,8 @@ The buffer is shown in the selected window and made current."
     (should (null point-history--entries))))
 
 (ert-deftest point-history-test-edit-ending-in-other-buffer ()
-  "A command that edits and ends in another buffer records no edit."
+  "A command that edits and ends in another buffer records no edit.
+It records a visit of the other buffer only."
   (point-history-test--with-fixture
     (let ((a (point-history-test--file-buffer "a.txt")))
       (point-history-test--file-buffer "b.txt")
@@ -213,7 +218,12 @@ The buffer is shown in the selected window and made current."
         (insert "x")
         (switch-to-buffer (get-file-buffer
                            (expand-file-name "b.txt" point-history-test--dir))))
-      (should (null point-history--entries)))))
+      (should (equal (mapcar #'point-history--entry-kind point-history--entries)
+                     '(visit)))
+      (should (eq (marker-buffer (point-history--entry-marker
+                                  (car point-history--entries)))
+                  (get-file-buffer
+                   (expand-file-name "b.txt" point-history-test--dir)))))))
 
 (ert-deftest point-history-test-copy-records ()
   "A copy command records."
@@ -704,7 +714,9 @@ Back then goes to the current entry itself."
 (ert-deftest point-history-test-other-buffer-ends-navigating ()
   "Showing another buffer ends the navigating state; the index stays."
   (point-history-test--with-fixture
-    (let ((b (point-history-test--file-buffer "b.txt")))
+    ;; A file visit would reset the index (rule 3).
+    (let ((b (point-history-test--file-buffer "b.txt"))
+          (point-history-record-file-visits nil))
       (point-history-test--file-buffer "a.txt")
       (point-history-test--edit-at 10)
       (point-history-test--edit-at 50)
@@ -951,6 +963,342 @@ Back then goes to the current entry itself."
       (should (equal calls (list a)))
       (should (eq (current-buffer) a))
       (should (= (line-number-at-pos) 10)))))
+
+;;;; File visits
+
+(defvar point-history-test--time 100.0
+  "The time returned by the stubbed `point-history--now'.")
+
+(defmacro point-history-test--with-clock (&rest body)
+  "Run BODY with `point-history--now' returning `point-history-test--time'."
+  (declare (indent 0) (debug t))
+  `(let ((point-history-test--time 100.0))
+     (cl-letf (((symbol-function 'point-history--now)
+                (lambda () point-history-test--time)))
+       ,@body)))
+
+(defun point-history-test--visit (name &optional line command)
+  "Run COMMAND (default `find-file') that visits file NAME at LINE.
+The file is created with 200 lines if it does not exist.  Return
+the buffer."
+  (let ((file (point-history-test--file name)))
+    (unless (file-exists-p file)
+      (with-temp-file file
+        (dotimes (i 200)
+          (insert (format "line %d\n" (1+ i))))))
+    (point-history-test--command (or command 'find-file)
+      (find-file file)
+      (when line
+        (point-history-test--goto-line line)))
+    (get-file-buffer file)))
+
+(defun point-history-test--other-buffer ()
+  "Return a buffer that visits no file, without showing it."
+  (let ((buffer (get-buffer-create "*point-history-test-other*")))
+    (push buffer point-history-test--buffers)
+    buffer))
+
+(defun point-history-test--leave (buffer)
+  "Run `switch-to-buffer' to show BUFFER."
+  (point-history-test--command 'switch-to-buffer
+    (switch-to-buffer buffer)))
+
+(ert-deftest point-history-test-visit-creates-placeholder ()
+  "Visiting another file creates a `visit' entry at point."
+  (point-history-test--with-fixture
+    (point-history-test--with-clock
+      (point-history-test--file-buffer "a.txt")
+      (point-history-test--edit-at 10)
+      (point-history-test--visit "b.txt" 30)
+      (should (equal (point-history-test--places)
+                     '(("b.txt" . 30) ("a.txt" . 10))))
+      (should (equal (point-history-test--kinds) '(visit activity)))
+      (should (equal (point-history--entry-file (car point-history--entries))
+                     (point-history-test--file "b.txt"))))))
+
+(ert-deftest point-history-test-visit-replaced-by-edit ()
+  "The first edit in the visited file replaces the placeholder, however far."
+  (point-history-test--with-fixture
+    (point-history-test--with-clock
+      (point-history-test--file-buffer "a.txt")
+      (point-history-test--edit-at 10)
+      (point-history-test--visit "b.txt" 1)
+      (let ((visit (car point-history--entries)))
+        (point-history-test--edit-at 150)
+        (should (eq (car point-history--entries) visit))
+        (should (equal (point-history-test--places)
+                       '(("b.txt" . 150) ("a.txt" . 10))))
+        (should (equal (point-history-test--kinds) '(activity activity)))))))
+
+(ert-deftest point-history-test-visit-replaced-by-idle ()
+  "Idle time in the visited file replaces the placeholder."
+  (point-history-test--with-fixture
+    (point-history-test--with-clock
+      (point-history-test--file-buffer "a.txt")
+      (point-history-test--edit-at 10)
+      (point-history-test--visit "b.txt" 1)
+      (let ((visit (car point-history--entries)))
+        (point-history-test--move-to 120)
+        (point-history--idle)
+        (should (eq (car point-history--entries) visit))
+        (should (equal (point-history-test--places)
+                       '(("b.txt" . 120) ("a.txt" . 10))))
+        (should (equal (point-history-test--kinds) '(activity activity)))))))
+
+(ert-deftest point-history-test-visit-short-stay-undone ()
+  "Leaving before the minimum stay undoes the visit.
+The entry removed by the near rule is put back at its former
+position; the dropped forward history is not restored."
+  (point-history-test--with-fixture
+    (point-history-test--with-clock
+      (let ((plain (point-history-test--plain-buffer "*point-history-test*")))
+        (point-history-test--file-buffer "b.txt")
+        (point-history-test--edit-at 20)
+        (point-history-test--file-buffer "a.txt")
+        (point-history-test--edit-at 10)
+        (point-history-test--edit-at 50)
+        (point-history-test--edit-at 90)
+        (let ((b20 (nth 3 point-history--entries)))
+          (point-history-test--back)
+          (point-history-test--back)
+          (should (equal (point-history-test--here) '("a.txt" . 10)))
+          (point-history-test--visit "b.txt" 22)
+          (should (equal (point-history-test--places)
+                         '(("b.txt" . 22) ("a.txt" . 10))))
+          (should (equal point-history--near-removed (cons b20 1)))
+          (let ((visit (car point-history--entries)))
+            (setq point-history-test--time 100.9)
+            (point-history-test--leave plain)
+            (should (equal (point-history-test--places)
+                           '(("a.txt" . 10) ("b.txt" . 20))))
+            (should (eq (nth 1 point-history--entries) b20))
+            (should (= point-history--index 0))
+            (should-not point-history--pending-visit)
+            (should-not (marker-buffer (point-history--entry-marker visit)))))))))
+
+(ert-deftest point-history-test-visit-near-entry-put-back-at-front ()
+  "A near entry that was the newest is put back at the front."
+  (point-history-test--with-fixture
+    (point-history-test--with-clock
+      (point-history-test--file-buffer "a.txt")
+      (point-history-test--edit-at 10)
+      (let ((b (point-history-test--file-buffer "b.txt")))
+        (point-history-test--edit-at 20)
+        (let ((b20 (car point-history--entries)))
+          (point-history-test--leave (point-history-test--other-buffer))
+          (point-history-test--command 'switch-to-buffer
+            (switch-to-buffer b)
+            (point-history-test--goto-line 23))
+          (should (equal (point-history-test--places)
+                         '(("b.txt" . 23) ("a.txt" . 10))))
+          (point-history-test--leave (point-history-test--other-buffer))
+          (should (equal (point-history-test--places)
+                         '(("b.txt" . 20) ("a.txt" . 10))))
+          (should (eq (car point-history--entries) b20))
+          (should (= point-history--index 0)))))))
+
+(ert-deftest point-history-test-visit-long-stay-kept ()
+  "Leaving after the minimum stay keeps the visit."
+  (point-history-test--with-fixture
+    (point-history-test--with-clock
+      (let ((a (point-history-test--file-buffer "a.txt")))
+        (point-history-test--edit-at 10)
+        (point-history-test--visit "b.txt" 30)
+        (setq point-history-test--time 101.0)
+        (point-history-test--leave (point-history-test--other-buffer))
+        (should (equal (point-history-test--places)
+                       '(("b.txt" . 30) ("a.txt" . 10))))
+        (should (equal (point-history-test--kinds) '(visit activity)))
+        (should-not point-history--pending-visit)
+        ;; A later short stay elsewhere does not undo it.
+        (point-history-test--command 'switch-to-buffer
+          (switch-to-buffer a)
+          (point-history-test--goto-line 150))
+        (should (equal (point-history-test--kinds) '(visit visit activity)))
+        (point-history-test--leave (point-history-test--other-buffer))
+        (should (equal (point-history-test--places)
+                       '(("b.txt" . 30) ("a.txt" . 10))))))))
+
+(ert-deftest point-history-test-visit-activity-prevents-undo ()
+  "Activity in the visited file before leaving prevents the undo."
+  (point-history-test--with-fixture
+    (point-history-test--with-clock
+      (point-history-test--file-buffer "a.txt")
+      (point-history-test--edit-at 10)
+      (point-history-test--visit "b.txt" 30)
+      (point-history-test--edit-at 32)
+      (setq point-history-test--time 100.1)
+      (point-history-test--leave (point-history-test--other-buffer))
+      (should (equal (point-history-test--places)
+                     '(("b.txt" . 32) ("a.txt" . 10))))
+      (should (equal (point-history-test--kinds) '(activity activity))))))
+
+(ert-deftest point-history-test-visit-left-by-another-visit ()
+  "Visiting a third file soon undoes the first visit and records the new one."
+  (point-history-test--with-fixture
+    (point-history-test--with-clock
+      (let ((a (point-history-test--file-buffer "a.txt")))
+        (point-history-test--edit-at 10)
+        (point-history-test--file-buffer "b.txt")
+        (point-history-test--edit-at 20)
+        (switch-to-buffer a))
+      (let ((b20 (car point-history--entries)))
+        (point-history-test--visit "b.txt" 21)
+        (should (equal (point-history-test--places)
+                       '(("b.txt" . 21) ("a.txt" . 10))))
+        (point-history-test--visit "c.txt" 5)
+        (should (equal (point-history-test--places)
+                       '(("c.txt" . 5) ("b.txt" . 20) ("a.txt" . 10))))
+        (should (eq (nth 1 point-history--entries) b20))
+        (should (equal (point-history-test--kinds) '(visit activity activity)))
+        (should (marker-buffer (point-history--entry-marker b20)))))))
+
+(ert-deftest point-history-test-visit-left-by-back ()
+  "Back within the minimum stay undoes the visit; the index stays on the target."
+  (point-history-test--with-fixture
+    (point-history-test--with-clock
+      (point-history-test--file-buffer "a.txt")
+      (point-history-test--edit-at 10)
+      (let ((b (point-history-test--file-buffer "b.txt")))
+        (point-history-test--edit-at 20)
+        (let ((b20 (car point-history--entries))
+              (a10 (nth 1 point-history--entries)))
+          (point-history-test--leave (point-history-test--other-buffer))
+          (point-history-test--command 'switch-to-buffer
+            (switch-to-buffer b)
+            (point-history-test--goto-line 22))
+          (should (equal (point-history-test--places)
+                         '(("b.txt" . 22) ("a.txt" . 10))))
+          (setq point-history-test--time 100.5)
+          (should (equal (point-history-test--back) '("Back 2/2")))
+          (should (equal (point-history-test--here) '("a.txt" . 10)))
+          (should (equal (point-history-test--places)
+                         '(("b.txt" . 20) ("a.txt" . 10))))
+          (should (eq (car point-history--entries) b20))
+          (should (= point-history--index 1))
+          (should (eq (point-history--current-entry) a10))
+          (should (equal (point-history-test--back) '("At oldest place")))
+          (should (equal (point-history-test--forward) '("Forward 1/2")))
+          (should (equal (point-history-test--here) '("b.txt" . 20))))))))
+
+(ert-deftest point-history-test-visit-left-by-back-older-near-entry ()
+  "Back within the minimum stay with the near entry put back behind the target."
+  (point-history-test--with-fixture
+    (point-history-test--with-clock
+      (let ((b (point-history-test--file-buffer "b.txt")))
+        (point-history-test--edit-at 20)
+        (point-history-test--file-buffer "a.txt")
+        (point-history-test--edit-at 10)
+        (point-history-test--edit-at 50)
+        (let ((a50 (car point-history--entries)))
+          (point-history-test--leave (point-history-test--other-buffer))
+          (point-history-test--command 'switch-to-buffer
+            (switch-to-buffer b)
+            (point-history-test--goto-line 22))
+          (should (equal (point-history-test--places)
+                         '(("b.txt" . 22) ("a.txt" . 50) ("a.txt" . 10))))
+          (should (equal (point-history-test--back) '("Back 2/3")))
+          (should (equal (point-history-test--places)
+                         '(("a.txt" . 50) ("a.txt" . 10) ("b.txt" . 20))))
+          (should (= point-history--index 0))
+          (should (eq (point-history--current-entry) a50))
+          (should (equal (point-history-test--back) '("Back 2/3")))
+          (should (equal (point-history-test--here) '("a.txt" . 10))))))))
+
+(ert-deftest point-history-test-visit-new-place-prevents-undo ()
+  "Activity recorded as a new place in the visited file prevents the undo."
+  (point-history-test--with-fixture
+    (point-history-test--with-clock
+      (point-history-test--file-buffer "a.txt")
+      (point-history-test--edit-at 10)
+      (let ((b (point-history-test--file-buffer "b.txt")))
+        (point-history-test--edit-at 20)
+        (let ((b20 (car point-history--entries)))
+          (point-history-test--leave (point-history-test--other-buffer))
+          (point-history-test--command 'switch-to-buffer
+            (switch-to-buffer b)
+            (point-history-test--goto-line 22))
+          (point-history-test--move-to 150)
+          ;; Back inserts a return entry before the visit and lands on it.
+          (point-history-test--back)
+          (should (equal (point-history-test--kinds) '(return visit activity)))
+          (should (equal (point-history-test--here) '("b.txt" . 22)))
+          ;; Neither rule 1 nor rule 2 applies: a new place.
+          (point-history-test--edit-at 100)
+          (should (equal (point-history-test--places)
+                         '(("b.txt" . 100) ("b.txt" . 22) ("a.txt" . 10))))
+          (should-not point-history--pending-visit)
+          (point-history-test--leave (point-history-test--other-buffer))
+          (should (equal (point-history-test--places)
+                         '(("b.txt" . 100) ("b.txt" . 22) ("a.txt" . 10))))
+          (should-not (marker-buffer (point-history--entry-marker b20))))))))
+
+(ert-deftest point-history-test-no-visit-when-option-nil ()
+  "No visit is recorded when `point-history-record-file-visits' is nil."
+  (point-history-test--with-fixture
+    (let ((point-history-record-file-visits nil))
+      (point-history-test--file-buffer "a.txt")
+      (point-history-test--visit "b.txt" 30)
+      (should (null point-history--entries)))))
+
+(ert-deftest point-history-test-no-visit-while-minibuffer-active ()
+  "No visit is recorded while the minibuffer is active."
+  (dolist (stub (list (cons 'minibuffer-depth (lambda () 1))
+                      (cons 'active-minibuffer-window #'minibuffer-window)))
+    (point-history-test--with-fixture
+      (point-history-test--file-buffer "a.txt")
+      (let ((file (point-history-test--file "b.txt")))
+        (with-temp-file file (insert "text\n"))
+        (let ((this-command 'consult-buffer))
+          ;; The command starts outside the minibuffer, then previews.
+          (point-history--pre-command)
+          (cl-letf (((symbol-function (car stub)) (cdr stub)))
+            (find-file file)
+            (point-history--post-command)))
+        (should (null point-history--entries))))))
+
+(ert-deftest point-history-test-edit-after-reading-minibuffer ()
+  "A command that reads from the minibuffer and then edits records."
+  (point-history-test--with-fixture
+    (point-history-test--file-buffer "a.txt")
+    (point-history-test--goto-line 20)
+    (point-history-test--command 'query-replace
+      ;; Commands typed into the minibuffer run their own hooks.
+      (cl-letf (((symbol-function 'minibuffer-depth) (lambda () 1)))
+        (with-temp-buffer
+          (point-history-test--command 'self-insert-command
+            (insert "y"))))
+      (insert "x"))
+    (should (equal (point-history-test--lines) '(20)))))
+
+(ert-deftest point-history-test-no-visit-by-own-command ()
+  "A point-history command switching buffers records no visit."
+  (point-history-test--with-fixture
+    (point-history-test--file-buffer "a.txt")
+    (point-history-test--visit "b.txt" 30 'point-history-list)
+    (should (null point-history--entries))))
+
+(ert-deftest point-history-test-no-visit-of-unrecordable-buffer ()
+  "Buffers that are not recordable or visit no file record no visit."
+  (point-history-test--with-fixture
+    (let ((a (point-history-test--file-buffer "a.txt"))
+          (b (point-history-test--file-buffer "b.txt"))
+          (plain (point-history-test--plain-buffer "*point-history-test*")))
+      (with-current-buffer b (special-mode))
+      (switch-to-buffer a)
+      (point-history-test--leave b)
+      (should (null point-history--entries))
+      (let ((point-history-file-buffers-only nil))
+        (point-history-test--leave plain)
+        (should (null point-history--entries))))))
+
+(ert-deftest point-history-test-no-visit-without-buffer-change ()
+  "A command that leaves the selected window on the same buffer records no visit."
+  (point-history-test--with-fixture
+    (point-history-test--file-buffer "a.txt")
+    (point-history-test--visit "a.txt" 30)
+    (point-history-test--move-to 100)
+    (should (null point-history--entries))))
 
 (provide 'point-history-test)
 ;;; point-history-test.el ends here

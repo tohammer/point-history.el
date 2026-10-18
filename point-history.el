@@ -132,6 +132,25 @@ removed.  The marker of ENTRY is kept alive so it can be put back.")
   "Non-nil if the last command was a navigation command.
 Set by `point-history--post-command'.")
 
+(cl-defstruct (point-history--visit
+               (:constructor point-history--make-visit)
+               (:copier nil))
+  "A file visit that is undone if it is left too soon.
+ENTRY is the `visit' entry, BUFFER the visited buffer, TIME the
+time of the visit (`point-history--now') and NEAR-REMOVED the value
+of `point-history--near-removed' right after the visit was recorded."
+  entry buffer time near-removed)
+
+(defvar point-history--pending-visit nil
+  "The last file visit, a `point-history--visit', or nil.
+It is cleared when the selected window leaves the visited buffer.")
+
+(defun point-history--pending-near-p (entry)
+  "Return non-nil if ENTRY may be put back by the pending visit."
+  (and point-history--pending-visit
+       (eq entry (car (point-history--visit-near-removed
+                       point-history--pending-visit)))))
+
 (defun point-history--release (entry)
   "Release the markers of ENTRY."
   (set-marker (point-history--entry-marker entry) nil)
@@ -200,7 +219,8 @@ entry at the front.  Store the removed entry in
 `point-history--near-removed'.  Return the new entry."
   (let ((previous point-history--near-removed))
     (setq point-history--near-removed nil)
-    (when previous
+    (when (and previous
+               (not (point-history--pending-near-p (car previous))))
       (point-history--release-unless-listed (car previous))))
   (let ((dropped (cl-subseq point-history--entries 0 point-history--index)))
     (setq point-history--entries
@@ -226,7 +246,12 @@ KIND defaults to `activity'.  Apply the recording rules:
 2. else if the newest entry is a `visit' entry in the current
    buffer, move it to point;
 3. else record a new entry (`point-history--record-new').
+Activity in the buffer of the pending visit keeps that visit.
 Return the entry that was moved or recorded."
+  (when (and point-history--pending-visit
+             (eq (point-history--visit-buffer point-history--pending-visit)
+                 (current-buffer)))
+    (point-history--end-visit))
   (let ((kind (or kind 'activity))
         (current (point-history--current-entry))
         (newest (car point-history--entries)))
@@ -282,11 +307,24 @@ Such commands have a non-nil `point-history-navigation' property."
 (defvar point-history--pre-tick nil
   "The character change tick of `point-history--pre-buffer'.")
 
+(defvar point-history--pre-window-buffer nil
+  "The buffer of the selected window when the running command started.
+It is only set while the minibuffer is not active.")
+
+(defun point-history--minibuffer-active-p ()
+  "Return non-nil if a minibuffer is active."
+  (or (> (minibuffer-depth) 0) (active-minibuffer-window)))
+
 (defun point-history--pre-command ()
-  "Remember the buffer and its change tick before a command."
+  "Remember the buffer, its change tick and the window buffer.
+Do nothing while the minibuffer is active: commands run inside it
+must not overwrite what the command reading from it remembered."
   (point-history--catching-errors
-    (setq point-history--pre-buffer (current-buffer)
-          point-history--pre-tick (buffer-chars-modified-tick))))
+    (unless (point-history--minibuffer-active-p)
+      (setq point-history--pre-buffer (current-buffer)
+            point-history--pre-tick (buffer-chars-modified-tick)
+            point-history--pre-window-buffer
+            (window-buffer (selected-window))))))
 
 (defun point-history--command-activity-p ()
   "Return non-nil if the command that just ran counts as activity.
@@ -314,27 +352,148 @@ The index stays where it is."
                      (point-history--near-p current))))
       (setq point-history--navigating nil))))
 
+;;;; File visits
+
+(defun point-history--now ()
+  "Return the current time in seconds."
+  (float-time))
+
+(defun point-history--own-command-p (command)
+  "Return non-nil if COMMAND is a point-history command."
+  (and command
+       (symbolp command)
+       (string-prefix-p "point-history-" (symbol-name command))))
+
+(defun point-history--visit-target-p (buffer)
+  "Return non-nil if showing BUFFER after the current command is a visit.
+That is the case if `point-history-record-file-visits' is non-nil,
+the command is not a point-history command and BUFFER is a
+recordable buffer that visits a file."
+  (and point-history-record-file-visits
+       (not (point-history--own-command-p this-command))
+       (buffer-file-name buffer)
+       (point-history--recordable-p buffer)))
+
+(defun point-history--record-visit (window)
+  "Record a visit at point of WINDOW in its buffer (rule 3).
+Make it the pending visit."
+  (let ((buffer (window-buffer window)))
+    (with-current-buffer buffer
+      (save-excursion
+        (goto-char (window-point window))
+        (let ((entry (point-history--record-new 'visit)))
+          (setq point-history--pending-visit
+                (point-history--make-visit
+                 :entry entry
+                 :buffer buffer
+                 :time (point-history--now)
+                 :near-removed point-history--near-removed)))))))
+
+(defun point-history--undo-visit (visit)
+  "Remove the entry of VISIT and put back the entry it removed.
+The entry removed by the near rule is put back at its former
+position, clamped to the length of the history, unless its buffer is
+gone or it is in the history already.  Adjust the index so that it
+still refers to the same entry; if that was the removed entry, keep
+the index number, clamped to the history."
+  (let* ((entry (point-history--visit-entry visit))
+         (near-removed (point-history--visit-near-removed visit))
+         (near (car near-removed))
+         (index point-history--index)
+         (current (nth index point-history--entries)))
+    (setq point-history--entries (delq entry point-history--entries))
+    (point-history--release entry)
+    (when near
+      (if (and (marker-buffer (point-history--entry-marker near))
+               (not (memq near point-history--entries)))
+          (let ((position (min (cdr near-removed)
+                               (length point-history--entries))))
+            (setq point-history--entries
+                  (append (cl-subseq point-history--entries 0 position)
+                          (cons near (nthcdr position
+                                             point-history--entries)))))
+        (point-history--release-unless-listed near)))
+    (when (eq point-history--near-removed near-removed)
+      (setq point-history--near-removed nil))
+    (setq point-history--index
+          (cond
+           ((and current (not (eq current entry)))
+            (cl-position current point-history--entries))
+           (t (max 0 (min index (1- (length point-history--entries)))))))))
+
+(defun point-history--end-visit ()
+  "Clear the pending visit without undoing it.
+Release the entry it could have put back unless that entry is in the
+history or still kept in `point-history--near-removed'."
+  (let ((near (car (point-history--visit-near-removed
+                    point-history--pending-visit))))
+    (setq point-history--pending-visit nil)
+    (when (and near (not (eq near (car point-history--near-removed))))
+      (point-history--release-unless-listed near))))
+
+(defun point-history--leave-visit ()
+  "Handle leaving the buffer of the pending visit and clear it.
+Undo the visit if it lasted less than `point-history-visit-min-stay'
+seconds and its entry is still a `visit' entry in the history.
+Activity in the visited buffer clears the pending visit before (see
+`point-history--activity'), so it is never undone after activity."
+  (let* ((visit point-history--pending-visit)
+         (entry (point-history--visit-entry visit)))
+    (if (and (< (- (point-history--now) (point-history--visit-time visit))
+                point-history-visit-min-stay)
+             (memq entry point-history--entries)
+             (eq (point-history--entry-kind entry) 'visit))
+        (progn
+          (setq point-history--pending-visit nil)
+          (point-history--undo-visit visit))
+      (point-history--end-visit))))
+
+(defun point-history--check-buffer-change ()
+  "Handle file visits after a command.
+If the selected window shows another buffer than before the command,
+handle leaving the pending visit (`point-history--leave-visit') and
+record a visit if the new buffer qualifies (`point-history--visit-target-p').
+Do nothing while the minibuffer is active."
+  (unless (point-history--minibuffer-active-p)
+    (let ((before point-history--pre-window-buffer)
+          (window (selected-window)))
+      (setq point-history--pre-window-buffer nil)
+      (when (and before (not (eq before (window-buffer window))))
+        (let ((buffer (window-buffer window)))
+          (when (and point-history--pending-visit
+                     (not (eq buffer (point-history--visit-buffer
+                                      point-history--pending-visit))))
+            (point-history--leave-visit))
+          (when (point-history--visit-target-p buffer)
+            (point-history--record-visit window)))))))
+
 (defun point-history--post-command ()
   "Record activity after a command if it was an edit or a copy.
-Also remember whether the command was a navigation command and, after
+Also handle file visits (`point-history--check-buffer-change'),
+remember whether the command was a navigation command and, after
 another command, end the navigating state if point left the current
-entry."
+entry.  Do nothing while the minibuffer is active, so a command that
+reads from it (e.g. `query-replace' or one run by \\[execute-extended-command])
+is judged as a whole."
   (point-history--catching-errors
-    (let ((navigation (point-history--navigation-command-p this-command)))
-      ;; A navigation command that moved nowhere outside the navigating
-      ;; state does not count, so the next one still applies the return
-      ;; point rule.
-      (setq point-history--last-navigation
-            (and navigation point-history--navigating))
-      (unless navigation
-        (when (and (point-history--command-activity-p)
-                   (eq (current-buffer) (window-buffer (selected-window)))
-                   (point-history--recordable-p))
-          (point-history--activity 'activity))
-        (when point-history--navigating
-          (point-history--check-navigating))))
-    (setq point-history--pre-buffer nil
-          point-history--pre-tick nil)))
+    (unless (point-history--minibuffer-active-p)
+      (let ((navigation (point-history--navigation-command-p this-command)))
+        ;; A navigation command that moved nowhere outside the navigating
+        ;; state does not count, so the next one still applies the return
+        ;; point rule.
+        (setq point-history--last-navigation
+              (and navigation point-history--navigating))
+        (point-history--catching-errors
+          (point-history--check-buffer-change))
+        (unless navigation
+          (when (and (point-history--command-activity-p)
+                     (eq (current-buffer) (window-buffer (selected-window)))
+                     (point-history--recordable-p))
+            (point-history--activity 'activity))
+          (when point-history--navigating
+            (point-history--check-navigating))))
+      (setq point-history--pre-buffer nil
+            point-history--pre-tick nil))))
 
 (defun point-history--idle ()
   "Record reading at point of the selected window.

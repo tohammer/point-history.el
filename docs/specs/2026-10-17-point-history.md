@@ -245,7 +245,7 @@ Manual checks in a real Emacs session with the suggested bindings:
 - [x] 3. Navigation: back/forward, return point, navigating state, window
   start, killed buffers and missing files, messages. *Done when* the
   navigation tests pass in `make all`.
-- [ ] 4. File visits: placeholders, replacement by first activity, undo
+- [x] 4. File visits: placeholders, replacement by first activity, undo
   on short stay. *Done when* the file-visit tests pass in `make all`.
 - [ ] 5. Filtered navigation: back/forward by file and within file.
   *Done when* the by-file and in-file tests pass in `make all`.
