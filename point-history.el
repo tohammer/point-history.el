@@ -108,8 +108,9 @@ WINDOW-START a marker at the window start when it was recorded and
 KIND one of `activity', `visit' or `return'.  When the buffer of
 MARKER is killed, POSITION and START-POSITION hold the positions of
 MARKER and WINDOW-START at that time, so that the entry can be
-reopened; they are nil otherwise."
-  marker file window-start kind position start-position)
+reopened; they are nil otherwise.  BUFFER-NAME is the name of the
+buffer at that time, used to name the entry when it is removed."
+  marker file window-start kind position start-position buffer-name)
 
 (defvar point-history--entries nil
   "The history: a list of `point-history--entry', newest first.")
@@ -189,28 +190,42 @@ else point."
 (defun point-history--near-p (entry)
   "Return non-nil if ENTRY is near point in the current buffer.
 Near means in the same buffer and at most `point-history-distance'
-lines apart."
+lines apart, whatever the narrowing.  At most that many lines are
+scanned."
   (let ((marker (point-history--entry-marker entry)))
     (and (eq (marker-buffer marker) (current-buffer))
          (save-excursion
-           (let ((a (min marker (point)))
-                 (b (max marker (point))))
-             (goto-char a)
-             (<= (count-lines (line-beginning-position)
-                              (progn (goto-char b) (line-beginning-position)))
-                 point-history-distance))))))
+           (save-restriction
+             (widen)
+             (let ((a (min marker (point)))
+                   (b (max marker (point))))
+               (goto-char b)
+               (let ((b-line (line-beginning-position)))
+                 (goto-char a)
+                 (forward-line (max 0 point-history-distance))
+                 (<= b-line (point)))))))))
 
 (defun point-history--current-entry ()
   "Return the entry at `point-history--index', or nil."
   (nth point-history--index point-history--entries))
 
-(defun point-history--limit-size ()
-  "Drop the oldest entries beyond `point-history-size'."
-  (let ((tail (nthcdr (1- (max 1 point-history-size))
-                      point-history--entries)))
+(defun point-history--truncate ()
+  "Remove the oldest entries beyond `point-history-size' and return them.
+Their markers are not released.  Clamp the index to the history."
+  (let* ((tail (nthcdr (1- (max 1 point-history-size))
+                       point-history--entries))
+         (dropped (cdr tail)))
     (when tail
-      (mapc #'point-history--release (cdr tail))
-      (setcdr tail nil))))
+      (setcdr tail nil))
+    (setq point-history--index
+          (max 0 (min point-history--index
+                      (1- (length point-history--entries)))))
+    dropped))
+
+(defun point-history--limit-size ()
+  "Drop the oldest entries beyond `point-history-size'.
+Clamp the index to the history."
+  (mapc #'point-history--release (point-history--truncate)))
 
 (defun point-history--record-new (kind)
   "Record a new entry of KIND at point (rule 3).
@@ -223,9 +238,10 @@ entry at the front.  Store the removed entry in
     (when (and previous
                (not (point-history--pending-near-p (car previous))))
       (point-history--release-unless-listed (car previous))))
-  (let ((dropped (cl-subseq point-history--entries 0 point-history--index)))
+  (let* ((index (min point-history--index (length point-history--entries)))
+         (dropped (cl-subseq point-history--entries 0 index)))
     (setq point-history--entries
-          (nthcdr point-history--index point-history--entries)
+          (nthcdr index point-history--entries)
           point-history--index 0
           point-history--navigating nil)
     (mapc #'point-history--release dropped))
@@ -349,8 +365,10 @@ The index stays where it is."
                              (point-history--entry-marker current)))
                  (with-current-buffer buffer
                    (save-excursion
-                     (goto-char (window-point window))
-                     (point-history--near-p current))))
+                     (save-restriction
+                       (widen)
+                       (goto-char (window-point window))
+                       (point-history--near-p current)))))
       (setq point-history--navigating nil))))
 
 ;;;; File visits
@@ -460,12 +478,15 @@ Do nothing while the minibuffer is active."
           (window (selected-window)))
       (setq point-history--pre-window-buffer nil)
       (when (and before (not (eq before (window-buffer window))))
+        ;; If BEFORE was killed, the window shows its replacement only
+        ;; because of that: no visit.
         (let ((buffer (window-buffer window)))
           (when (and point-history--pending-visit
                      (not (eq buffer (point-history--visit-buffer
                                       point-history--pending-visit))))
             (point-history--leave-visit))
-          (when (point-history--visit-target-p buffer)
+          (when (and (buffer-live-p before)
+                     (point-history--visit-target-p buffer))
             (point-history--record-visit window)))))))
 
 (defun point-history--post-command ()
@@ -530,7 +551,9 @@ Run from `kill-buffer-hook'."
                   (point-history--entry-start-position entry)
                   (marker-position (point-history--entry-window-start entry))
                   (point-history--entry-file entry)
-                  (or buffer-file-name (point-history--entry-file entry)))))))))
+                  (or buffer-file-name (point-history--entry-file entry))
+                  (point-history--entry-buffer-name entry)
+                  (buffer-name))))))))
 
 (defun point-history--reattach (buffer file)
   "Point the markers of all detached entries of FILE into BUFFER.
@@ -556,6 +579,14 @@ if there are none, clamped to the size of BUFFER."
                           buffer)
               (setf (point-history--entry-position entry) nil
                     (point-history--entry-start-position entry) nil))))))))
+
+(defun point-history--find-file ()
+  "Reattach the detached entries of the file just visited.
+Run from `find-file-hook', so that entries of a killed buffer count
+as near again when their file is opened."
+  (point-history--catching-errors
+    (when buffer-file-name
+      (point-history--reattach (current-buffer) buffer-file-name))))
 
 (defun point-history--entry-live-p (entry)
   "Return non-nil if ENTRY is in a live buffer, reopening it if needed.
@@ -583,7 +614,8 @@ Adjust the index so that it still refers to the same entry."
   (let ((file (point-history--entry-file entry)))
     (if file
         (message "point-history: removed %s, file no longer exists" file)
-      (message "point-history: removed entry, its buffer was killed"))))
+      (message "point-history: removed %s, its buffer was killed"
+               (or (point-history--entry-buffer-name entry) "entry")))))
 
 ;;;; Navigation
 
@@ -591,24 +623,53 @@ Adjust the index so that it still refers to the same entry."
   "Insert a `return' entry at point unless the last command navigated.
 On the first navigation command after another command, if point is
 not near the current entry, insert a `return' entry at point just
-before the current entry; the index then refers to it.
+before the current entry; the index then refers to it.  Entries that
+the insertion pushes beyond `point-history-size' are removed from the
+history but their markers are kept, so that the insertion can be
+undone (`point-history--settle-return-point').  Return a cons
+\(ENTRY . DROPPED) of the inserted entry and the removed entries.
 
-In a buffer that is not recordable no entry is inserted; return
-non-nil in that case, meaning that point is away from the current
-entry, so that going older should land on the current entry itself."
+In a buffer that is not recordable no entry is inserted, and neither
+is it if the size limit would push out the current entry; return
+`away' in these cases, meaning that point is away from the current
+entry, so that going older should land on the current entry itself.
+Otherwise return nil."
   (unless point-history--last-navigation
     (let ((current (point-history--current-entry)))
       (unless (and current (point-history--near-p current))
-        (if (not (point-history--recordable-p))
-            t
+        (if (or (not (point-history--recordable-p))
+                (and current
+                     (>= point-history--index
+                         (1- (max 1 point-history-size)))))
+            'away
+          (let ((entry (point-history--new-entry 'return)))
+            (setq point-history--entries
+                  (append (cl-subseq point-history--entries
+                                     0 point-history--index)
+                          (cons entry
+                                (nthcdr point-history--index
+                                        point-history--entries))))
+            (cons entry (point-history--truncate))))))))
+
+(defun point-history--settle-return-point (result success)
+  "Keep or undo the return entry of RESULT after a navigation.
+RESULT is the value of `point-history--apply-return-point'.  If
+SUCCESS is non-nil, release the markers of the entries it removed.
+Otherwise remove the inserted entry, put the removed entries back and
+set the index to the entry it referred to before, so that a command
+that found no target changes nothing."
+  (when (consp result)
+    (let ((entry (car result))
+          (dropped (cdr result)))
+      (if success
+          (mapc #'point-history--release dropped)
+        (let ((position (cl-position entry point-history--entries)))
           (setq point-history--entries
-                (append (cl-subseq point-history--entries
-                                   0 point-history--index)
-                        (cons (point-history--new-entry 'return)
-                              (nthcdr point-history--index
-                                      point-history--entries))))
-          (point-history--limit-size)
-          nil)))))
+                (append (delq entry point-history--entries) dropped))
+          (point-history--release entry)
+          (setq point-history--index
+                (max 0 (min (or position point-history--index)
+                            (1- (length point-history--entries))))))))))
 
 (defun point-history--search (direction &optional predicate from)
   "Return the index of the next usable entry in DIRECTION, or nil.
@@ -638,19 +699,24 @@ that is not possible it is removed and the search goes on."
 (defun point-history--show-entry (entry)
   "Show ENTRY in the selected window and go to its position.
 Switch the buffer in the selected window, or use `pop-to-buffer' if
-it is dedicated.  Restore the remembered window start if the
+it is dedicated.  Widen the buffer if the position is outside its
+accessible region.  Restore the remembered window start if the
 position is not visible."
   (let ((marker (point-history--entry-marker entry)))
     (if (window-dedicated-p (selected-window))
         (pop-to-buffer (marker-buffer marker))
       (switch-to-buffer (marker-buffer marker)))
+    (when (or (< marker (point-min)) (> marker (point-max)))
+      (widen))
     (goto-char marker)
     (let ((window (selected-window))
           (start (point-history--entry-window-start entry)))
       (when (and (eq (window-buffer window) (current-buffer))
                  (eq (marker-buffer start) (current-buffer))
                  (not (pos-visible-in-window-p (point) window)))
-        (set-window-start window start)))))
+        ;; NOFORCE: if redisplay finds point off-screen with this start,
+        ;; it picks another start instead of moving point.
+        (set-window-start window start t)))))
 
 (defun point-history--goto-index (index label)
   "Make INDEX the current entry, show it and echo LABEL and the position.
@@ -672,7 +738,8 @@ return non-nil."
                                           &optional predicate adjust)
   "Move to the next entry in DIRECTION for which PREDICATE holds.
 DIRECTION, PREDICATE: see `point-history--search'.  Apply the return
-point rule first (`point-history--apply-return-point').  If ADJUST is
+point rule first (`point-history--apply-return-point'); if no entry is
+found, the return entry is removed again.  If ADJUST is
 non-nil, call it with the index found and move to the index it
 returns instead.  LABEL is passed to `point-history--goto-index';
 END-MESSAGE is shown if there is no such entry.  Going newer from
@@ -683,15 +750,17 @@ index 0 shows END-MESSAGE without inserting a return entry."
    ((and (< direction 0) (= point-history--index 0))
     (message "%s" end-message))
    (t
-    (let* ((away (point-history--apply-return-point))
-           (from (if (and away (> direction 0))
+    (let* ((result (point-history--apply-return-point))
+           (from (if (and (eq result 'away) (> direction 0))
                      (1- point-history--index)
                    point-history--index))
            (index (point-history--search direction predicate from)))
       (when (and index adjust)
         (setq index (funcall adjust index)))
-      (unless (and index (point-history--goto-index index label))
-        (message "%s" end-message))))))
+      (let ((success (and index (point-history--goto-index index label))))
+        (point-history--settle-return-point result success)
+        (unless success
+          (message "%s" end-message)))))))
 
 ;;;; Filters
 
@@ -839,9 +908,12 @@ The places are listed in history order, newest first."
                     nil t))
            (entry (cdr (assoc choice alist))))
       (when entry
-        (point-history--apply-return-point)
-        (let ((index (cl-position entry point-history--entries)))
-          (unless (and index (point-history--goto-index index "Go to"))
+        (let* ((result (point-history--apply-return-point))
+               (index (cl-position entry point-history--entries))
+               (success (and index
+                             (point-history--goto-index index "Go to"))))
+          (point-history--settle-return-point result success)
+          (unless success
             (message "Place no longer in the history")))))))
 (put 'point-history-list 'point-history-navigation t)
 
@@ -881,13 +953,15 @@ history."
         (add-hook 'pre-command-hook #'point-history--pre-command)
         (add-hook 'post-command-hook #'point-history--post-command)
         (add-hook 'kill-buffer-hook #'point-history--kill-buffer)
+        (add-hook 'find-file-hook #'point-history--find-file)
         (when point-history-idle-delay
           (setq point-history--timer
                 (run-with-idle-timer point-history-idle-delay t
                                      #'point-history--idle))))
     (remove-hook 'pre-command-hook #'point-history--pre-command)
     (remove-hook 'post-command-hook #'point-history--post-command)
-    (remove-hook 'kill-buffer-hook #'point-history--kill-buffer)))
+    (remove-hook 'kill-buffer-hook #'point-history--kill-buffer)
+    (remove-hook 'find-file-hook #'point-history--find-file)))
 
 (provide 'point-history)
 ;;; point-history.el ends here

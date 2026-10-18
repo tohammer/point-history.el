@@ -400,6 +400,7 @@ It records a visit of the other buffer only."
             (should (memq #'point-history--pre-command pre-command-hook))
             (should (memq #'point-history--post-command post-command-hook))
             (should (memq #'point-history--kill-buffer kill-buffer-hook))
+            (should (memq #'point-history--find-file find-file-hook))
             (should (memq point-history--timer timer-idle-list))
             (point-history-test--file-buffer "a.txt")
             (point-history-test--edit-at 10)
@@ -411,6 +412,7 @@ It records a visit of the other buffer only."
                                 post-command-hook))
               (should-not (memq #'point-history--kill-buffer
                                 kill-buffer-hook))
+              (should-not (memq #'point-history--find-file find-file-hook))
               (should-not (memq timer timer-idle-list))
               (should-not point-history--timer)
               (point-history-mode 1)
@@ -1433,7 +1435,10 @@ the buffers a, b and c."
         (point-history-test--edit-at 50)
         (save-buffer)
         (kill-buffer b))
-      (let ((b2 (find-file-noselect (point-history-test--file "b.txt"))))
+      ;; Opened without `find-file-hook' (as while the mode is off), so
+      ;; the entries of b stay detached.
+      (let ((b2 (let ((find-file-hook nil))
+                  (find-file-noselect (point-history-test--file "b.txt")))))
         (push b2 point-history-test--buffers)
         (switch-to-buffer b2)
         (point-history-test--goto-line 150)
@@ -1462,7 +1467,10 @@ the buffers a, b and c."
         (point-history-test--edit-at 50)
         (save-buffer)
         (kill-buffer b))
-      (let ((b2 (find-file-noselect (point-history-test--file "b.txt"))))
+      ;; Opened without `find-file-hook' (as while the mode is off), so
+      ;; the entries of b stay detached.
+      (let ((b2 (let ((find-file-hook nil))
+                  (find-file-noselect (point-history-test--file "b.txt")))))
         (push b2 point-history-test--buffers)
         (switch-to-buffer b2)
         (point-history-test--goto-line 150)
@@ -1612,6 +1620,252 @@ Return (MESSAGES CANDIDATES METADATA)."
     (cl-letf (((symbol-function 'minibufferp) (lambda (&rest _) t)))
       (should-error (point-history-remember) :type 'user-error))
     (should (null point-history--entries))))
+
+;;;; Review fixes
+
+(ert-deftest point-history-test-idle-timer ()
+  "Enabling the mode starts a repeating idle timer with the configured delay."
+  (let ((point-history-mode nil)
+        (point-history--timer nil)
+        (point-history-idle-delay 3))
+    (unwind-protect
+        (progn
+          (point-history-mode 1)
+          (let ((timer point-history--timer))
+            (should (timerp timer))
+            (should (memq timer timer-idle-list))
+            (should (timer--idle-delay timer))
+            (should (timer--repeat-delay timer))
+            (should (time-equal-p (timer--time timer) 3))
+            (should (eq (timer--function timer) #'point-history--idle))))
+      (point-history-mode -1))))
+
+(ert-deftest point-history-test-window-start-noforce ()
+  "The remembered window start is set without forcing it on redisplay."
+  (point-history-test--with-fixture
+    (point-history-test--file-buffer "a.txt")
+    (point-history-test--edit-at 20)
+    (point-history-test--edit-at 150)
+    (let ((calls nil))
+      (cl-letf (((symbol-function 'pos-visible-in-window-p)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'set-window-start)
+                 (lambda (&rest args) (push args calls))))
+        (point-history-test--back))
+      (should (equal (point-history-test--here) '("a.txt" . 20)))
+      (should (= (length calls) 1))
+      (should (eq (nth 0 (car calls)) (selected-window)))
+      (should (eq (nth 2 (car calls)) t)))))
+
+(ert-deftest point-history-test-near-ignores-narrowing ()
+  "An entry outside the narrowed region is compared with its real position."
+  (point-history-test--with-fixture
+    (point-history-test--file-buffer "a.txt" 2000)
+    (point-history-test--edit-at 100)
+    (point-history-test--goto-line 1000)
+    (narrow-to-region (point) (progn (forward-line 100) (point)))
+    (point-history-test--command 'self-insert-command
+      (goto-char (point-min))
+      (forward-line 2)
+      (insert "y"))
+    (widen)
+    (should (equal (point-history-test--lines) '(1002 100)))))
+
+(ert-deftest point-history-test-navigate-out-of-narrowing ()
+  "Navigating to an entry outside the narrowed region widens and lands on it.
+Leaving the entry for a narrowed region away from it ends the
+navigating state."
+  (point-history-test--with-fixture
+    (point-history-test--file-buffer "a.txt" 2000)
+    (point-history-test--edit-at 100)
+    (point-history-test--edit-at 1500)
+    (point-history-test--goto-line 1000)
+    (narrow-to-region (point) (progn (forward-line 100) (point)))
+    (point-history-test--command 'next-line
+      (goto-char (point-min))
+      (forward-line 50))
+    (should (equal (point-history-test--back) '("Back 2/3")))
+    (should-not (buffer-narrowed-p))
+    (should (= (point) (point-history--entry-marker
+                        (nth 1 point-history--entries))))
+    (should (equal (point-history-test--here) '("a.txt" . 1500)))
+    (should point-history--navigating)
+    (point-history-test--command 'narrow-to-region
+      (point-history-test--goto-line 1600)
+      (narrow-to-region (point) (progn (forward-line 100) (point)))
+      (goto-char (point-min)))
+    (should-not point-history--navigating)))
+
+(ert-deftest point-history-test-near-boundary ()
+  "Places exactly `point-history-distance' lines apart are near, one more is not."
+  (point-history-test--with-fixture
+    (point-history-test--file-buffer "a.txt")
+    (point-history-test--edit-at 20)
+    (let ((entry (car point-history--entries)))
+      (dolist (case '((30 . t) (31 . nil) (10 . t) (9 . nil) (20 . t)))
+        (point-history-test--goto-line (car case))
+        (end-of-line)
+        (should (eq (and (point-history--near-p entry) t) (cdr case))))
+      (let ((point-history-distance 0))
+        (point-history-test--goto-line 20)
+        (end-of-line)
+        (should (point-history--near-p entry))
+        (point-history-test--goto-line 21)
+        (should-not (point-history--near-p entry))))))
+
+(defun point-history-test--twenty-edits ()
+  "Record 20 places in a new file, at lines 100, 200, ... 2000."
+  (point-history-test--file-buffer "a.txt" 3000)
+  (dotimes (i 20)
+    (point-history-test--edit-at (* (1+ i) 100))))
+
+(ert-deftest point-history-test-limit-size-clamps-index ()
+  "Dropping entries beyond the size limit clamps the index."
+  (point-history-test--with-fixture
+    (point-history-test--twenty-edits)
+    (setq point-history--index 15)
+    (let ((point-history-size 5))
+      (point-history--limit-size))
+    (should (= (length point-history--entries) 5))
+    (should (= point-history--index 4))))
+
+(ert-deftest point-history-test-record-new-index-past-end ()
+  "Recording with an index past the end of the history does not fail."
+  (point-history-test--with-fixture
+    (point-history-test--twenty-edits)
+    (setq point-history--index 30)
+    (point-history-test--goto-line 2500)
+    (point-history--record-new 'activity)
+    (should (equal (point-history-test--lines) '(2500)))
+    (should (= point-history--index 0))))
+
+(ert-deftest point-history-test-size-shrunk-while-navigating ()
+  "Shrinking `point-history-size' far back in the history breaks nothing."
+  (point-history-test--with-fixture
+    (point-history-test--twenty-edits)
+    (setq point-history--index 15)
+    (setq point-history-size 5)
+    (point-history-test--move-to 2900)
+    (point-history-test--back)
+    (should (< point-history--index (length point-history--entries)))
+    (point-history-test--edit-at 2500)
+    (should-not point-history--last-error)
+    (should (equal (car (point-history-test--lines)) 2500))
+    (should (<= (length point-history--entries) 5))))
+
+(ert-deftest point-history-test-return-point-keeps-current-in-full-history ()
+  "In a full history, the return point never pushes out the current entry."
+  (point-history-test--with-fixture
+    (let ((point-history-size 3))
+      (point-history-test--file-buffer "a.txt")
+      (point-history-test--edit-at 10)
+      (point-history-test--edit-at 50)
+      (point-history-test--edit-at 90)
+      (point-history-test--back)
+      (point-history-test--back)
+      (should (equal (point-history-test--here) '("a.txt" . 10)))
+      (point-history-test--move-to 150)
+      (should (equal (point-history-test--back) '("Back 3/3")))
+      (should (equal (point-history-test--here) '("a.txt" . 10)))
+      (should (equal (point-history-test--lines) '(90 50 10)))
+      (should (= point-history--index 2)))))
+
+(ert-deftest point-history-test-failed-navigation-changes-nothing ()
+  "A navigation command that finds no target removes its return entry again."
+  (point-history-test--with-fixture
+    (point-history-test--file-buffer "a.txt")
+    (point-history-test--edit-at 10)
+    (point-history-test--move-to 150)
+    (should (equal (point-history-test--cmd 'point-history-back-file)
+                   '("No earlier file")))
+    (should (equal (point-history-test--lines) '(10)))
+    (should (equal (point-history-test--kinds) '(activity)))
+    (should (= point-history--index 0))
+    (should (equal (point-history-test--here) '("a.txt" . 150)))
+    ;; In a full history the entry pushed out by the return entry comes
+    ;; back.
+    (let ((point-history-size 3))
+      (point-history-test--edit-at 50)
+      (point-history-test--edit-at 90)
+      (let ((oldest (car (last point-history--entries))))
+        (point-history-test--move-to 150)
+        (should (equal (point-history-test--cmd 'point-history-back-file)
+                       '("No earlier file")))
+        (should (equal (point-history-test--lines) '(90 50 10)))
+        (should (eq (car (last point-history--entries)) oldest))
+        (should (marker-buffer (point-history--entry-marker oldest)))
+        (should (= point-history--index 0))))))
+
+(ert-deftest point-history-test-reopened-file-reattaches ()
+  "Opening the file of a killed buffer reattaches its entries, so they are near."
+  (point-history-test--with-fixture
+    (point-history-test--with-mode
+      (let ((a (point-history-test--file-buffer "a.txt")))
+        (point-history-test--edit-at 20)
+        (save-buffer)
+        (point-history-test--file-buffer "b.txt")
+        (point-history-test--edit-at 5)
+        (kill-buffer a)
+        (point-history-test--visit "a.txt" 21)
+        (point-history-test--edit-at 21)
+        (should (= (cl-count (point-history-test--file "a.txt")
+                             point-history--entries
+                             :key #'point-history--entry-file
+                             :test #'equal)
+                   1))
+        (should (equal (point-history-test--places)
+                       '(("a.txt" . 21) ("b.txt" . 5))))))))
+
+(ert-deftest point-history-test-find-file-hook-errors-caught ()
+  "Errors in the find-file hook function are reported, not signaled."
+  (point-history-test--with-fixture
+    (point-history-test--file-buffer "a.txt")
+    (let ((messages nil))
+      (cl-letf (((symbol-function 'point-history--reattach)
+                 (lambda (&rest _) (error "Boom")))
+                ((symbol-function 'message)
+                 (lambda (format &rest args)
+                   (push (apply #'format-message format args) messages))))
+        (point-history--find-file))
+      (should (equal messages '("point-history: Boom"))))))
+
+(ert-deftest point-history-test-killing-buffer-records-no-visit ()
+  "Killing the shown buffer records no visit of the buffer replacing it."
+  (point-history-test--with-fixture
+    (point-history-test--with-mode
+      (point-history-test--file-buffer "a.txt")
+      (point-history-test--edit-at 10)
+      (let ((b (point-history-test--file-buffer "b.txt")))
+        (point-history-test--edit-at 20)
+        (save-buffer)
+        (point-history-test--file-buffer "c.txt")
+        (point-history-test--edit-at 30)
+        (point-history-test--back)
+        (should (eq (current-buffer) b))
+        (should (= point-history--index 1))
+        (point-history-test--command 'kill-current-buffer
+          (kill-current-buffer))
+        (should-not (buffer-live-p b))
+        (should (buffer-file-name (window-buffer (selected-window))))
+        (should (equal (point-history-test--kinds)
+                       '(activity activity activity)))
+        (should (= point-history--index 1))))))
+
+(ert-deftest point-history-test-killed-buffer-removal-names-buffer ()
+  "Removing an entry of a killed buffer without a file names the buffer."
+  (point-history-test--with-fixture
+    (point-history-test--with-mode
+      (let ((point-history-file-buffers-only nil))
+        (point-history-test--file-buffer "a.txt")
+        (point-history-test--edit-at 10)
+        (let ((plain (point-history-test--plain-buffer "*point-history-test*")))
+          (point-history--idle)
+          (point-history-test--file-buffer "b.txt")
+          (point-history-test--edit-at 5)
+          (kill-buffer plain)
+          (should (equal (point-history-test--back)
+                         '("point-history: removed *point-history-test*, its buffer was killed"
+                           "Back 2/2"))))))))
 
 (provide 'point-history-test)
 ;;; point-history-test.el ends here

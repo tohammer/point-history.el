@@ -32,12 +32,14 @@ the same buffer) count as one place: new activity there moves the existing
 entry instead of adding another one. The history holds at most
 `point-history-size` entries; the oldest is dropped first.
 
-Navigation commands never record anything themselves. When you go back
-from a place that is not in the history, point-history first remembers
-where you were (the return point), so going forward brings you back
-there and on to the newer places. If you go back a few steps and then
-start working somewhere new, the places you went back over (the forward
-history) are dropped, as in a browser.
+Navigation commands record no activity. The only entry they add is the
+return point: on the first navigation command after other commands, if
+point is away from the current place in the history, that spot is
+remembered just before it, so that going forward brings you back there
+and on to the newer places. This applies to all navigation commands; a
+command that finds no target changes nothing. If you go back a few steps
+and then start working somewhere new, the places you went back over (the
+forward history) are dropped, as in a browser.
 
 ### Ordering
 
@@ -113,8 +115,9 @@ such buffers.
 
 All navigation commands move the same position in the history, so they
 can be mixed. If a buffer was killed, its entries are kept; navigating to
-one reopens the file at the remembered position. If the file is gone, the
-entry is removed and navigation continues to the next one.
+one reopens the file at the remembered position, and opening the file
+again yourself puts them back into the new buffer. If the file is gone,
+the entry is removed and navigation continues to the next one.
 
 ## Options
 

@@ -77,7 +77,10 @@ Activity, in a recordable buffer shown in the selected window:
    the command is not in `point-history-ignored-edit-commands`. The edit
    counts only if the command ends in the buffer it started in; otherwise
    it is at most a file visit (e.g. an `auto-insert` template in a newly
-   visited file, or a keyboard macro that edits and switches buffers).
+   visited file). Commands inside a keyboard macro run their own hooks,
+   so each is judged on its own. While the minibuffer is active the
+   hooks do nothing, so a command that reads from it (`query-replace`,
+   anything run by `M-x`) is judged as a whole.
    Changes made outside commands (process output, timers, auto-revert)
    are not activity.
 2. **Copy**: a command in `point-history-activity-commands` runs.
