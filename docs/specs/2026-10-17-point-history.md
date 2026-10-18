@@ -238,7 +238,7 @@ Manual checks in a real Emacs session with the suggested bindings:
   workflow, `.gitignore`, LICENSE, README skeleton with AI Disclaimer,
   one smoke test. *Done when* `make all` passes locally with Emacs 31
   and the file has no private information.
-- [ ] 2. History and recording: entries, recordable-buffer check, edit,
+- [x] 2. History and recording: entries, recordable-buffer check, edit,
   copy and idle activity, rules 1–3, size limit, error-catching hooks,
   mode on/off. *Done when* the recording tests listed under Testing pass
   in `make all`.

@@ -33,6 +33,8 @@
 
 ;;; Code:
 
+(require 'cl-lib)
+
 (defgroup point-history nil
   "Back/forward navigation by activity."
   :group 'convenience
@@ -50,7 +52,8 @@
 
 (defcustom point-history-idle-delay 2
   "Seconds without input that count as reading.
-If nil, recording of reading pauses is disabled."
+If nil, recording of reading pauses is disabled.  A change takes
+effect when `point-history-mode' is enabled again."
   :type '(choice (const :tag "Off" nil) number)
   :group 'point-history)
 
@@ -93,15 +96,251 @@ Modes derived from these are ignored as well."
   :type 'boolean
   :group 'point-history)
 
+;;;; History
+
+(cl-defstruct (point-history--entry
+               (:constructor point-history--make-entry)
+               (:copier nil))
+  "A remembered place.
+MARKER is the position, FILE the file name of its buffer or nil,
+WINDOW-START a marker at the window start when it was recorded and
+KIND one of `activity', `visit' or `return'."
+  marker file window-start kind)
+
+(defvar point-history--entries nil
+  "The history: a list of `point-history--entry', newest first.")
+
+(defvar point-history--index 0
+  "Position in `point-history--entries' of the current entry.
+It is 0 when not navigating.")
+
+(defvar point-history--navigating nil
+  "Non-nil while the user is navigating through the history.
+While non-nil, idle time does not record.")
+
+(defvar point-history--near-removed nil
+  "The entry removed by the near rule in the last new recording.
+A cons (ENTRY . POSITION), where POSITION is the entry's former
+position in `point-history--entries' after the forward history was
+dropped and before the new entry was added, or nil if no entry was
+removed.  The marker of ENTRY is kept alive so it can be put back.")
+
+(defun point-history--release (entry)
+  "Release the markers of ENTRY."
+  (set-marker (point-history--entry-marker entry) nil)
+  (set-marker (point-history--entry-window-start entry) nil))
+
+(defun point-history--release-unless-listed (entry)
+  "Release the markers of ENTRY unless it is in the history."
+  (unless (memq entry point-history--entries)
+    (point-history--release entry)))
+
+(defun point-history--window-start ()
+  "Return the window start to remember for point in the current buffer.
+This is the selected window's start if it shows the current buffer,
+else point."
+  (if (eq (window-buffer (selected-window)) (current-buffer))
+      (window-start (selected-window))
+    (point)))
+
+(defun point-history--new-entry (kind)
+  "Return a new entry of KIND at point in the current buffer."
+  (point-history--make-entry
+   :marker (point-marker)
+   :file buffer-file-name
+   :window-start (copy-marker (point-history--window-start))
+   :kind kind))
+
+(defun point-history--move-entry (entry kind)
+  "Move ENTRY to point in the current buffer and set its KIND."
+  (set-marker (point-history--entry-marker entry) (point))
+  (set-marker (point-history--entry-window-start entry)
+              (point-history--window-start))
+  (setf (point-history--entry-file entry) buffer-file-name
+        (point-history--entry-kind entry) kind))
+
+(defun point-history--near-p (entry)
+  "Return non-nil if ENTRY is near point in the current buffer.
+Near means in the same buffer and at most `point-history-distance'
+lines apart."
+  (let ((marker (point-history--entry-marker entry)))
+    (and (eq (marker-buffer marker) (current-buffer))
+         (save-excursion
+           (let ((a (min marker (point)))
+                 (b (max marker (point))))
+             (goto-char a)
+             (<= (count-lines (line-beginning-position)
+                              (progn (goto-char b) (line-beginning-position)))
+                 point-history-distance))))))
+
+(defun point-history--current-entry ()
+  "Return the entry at `point-history--index', or nil."
+  (nth point-history--index point-history--entries))
+
+(defun point-history--limit-size ()
+  "Drop the oldest entries beyond `point-history-size'."
+  (let ((tail (nthcdr (1- (max 1 point-history-size))
+                      point-history--entries)))
+    (when tail
+      (mapc #'point-history--release (cdr tail))
+      (setcdr tail nil))))
+
+(defun point-history--record-new (kind)
+  "Record a new entry of KIND at point (rule 3).
+Drop the entries newer than the index, reset the index to 0, remove
+an entry near point and put the new entry at the front.  Store the
+removed entry in `point-history--near-removed'.  Return the new
+entry."
+  (let ((previous point-history--near-removed))
+    (setq point-history--near-removed nil)
+    (when previous
+      (point-history--release-unless-listed (car previous))))
+  (let ((dropped (cl-subseq point-history--entries 0 point-history--index)))
+    (setq point-history--entries
+          (nthcdr point-history--index point-history--entries)
+          point-history--index 0)
+    (mapc #'point-history--release dropped))
+  (let ((position (cl-position-if #'point-history--near-p
+                                  point-history--entries)))
+    (when position
+      (let ((entry (nth position point-history--entries)))
+        (setq point-history--near-removed (cons entry position)
+              point-history--entries (delq entry point-history--entries)))))
+  (let ((entry (point-history--new-entry kind)))
+    (push entry point-history--entries)
+    (point-history--limit-size)
+    entry))
+
+(defun point-history--activity (&optional kind)
+  "Record activity of KIND at point in the current buffer.
+KIND defaults to `activity'.  Apply the recording rules:
+1. if point is near the current entry, move it to point;
+2. else if the newest entry is a `visit' entry in the current
+   buffer, move it to point;
+3. else record a new entry (`point-history--record-new').
+Return the entry that was moved or recorded."
+  (let ((kind (or kind 'activity))
+        (current (point-history--current-entry))
+        (newest (car point-history--entries)))
+    (cond
+     ((and current (point-history--near-p current))
+      (point-history--move-entry current kind)
+      current)
+     ((and newest
+           (eq (point-history--entry-kind newest) 'visit)
+           (eq (marker-buffer (point-history--entry-marker newest))
+               (current-buffer)))
+      (point-history--move-entry newest kind)
+      newest)
+     (t (point-history--record-new kind)))))
+
+;;;; Recording
+
+(defun point-history--recordable-p (&optional buffer)
+  "Return non-nil if BUFFER (default: the current buffer) is recordable.
+A recordable buffer is not a minibuffer, its major mode is not
+derived from one in `point-history-ignored-modes', and it visits a
+file unless `point-history-file-buffers-only' is nil."
+  (with-current-buffer (or buffer (current-buffer))
+    (and (not (minibufferp))
+         (not (apply #'derived-mode-p point-history-ignored-modes))
+         (or buffer-file-name (not point-history-file-buffers-only)))))
+
+(defun point-history--navigation-command-p (command)
+  "Return non-nil if COMMAND is a point-history navigation command.
+Such commands have a non-nil `point-history-navigation' property."
+  (and (symbolp command) (get command 'point-history-navigation)))
+
+(defvar point-history--last-error nil
+  "Text of the last error reported by the hooks or the timer.")
+
+(defun point-history--report-error (err)
+  "Show ERR with `message' unless it is the same as the last one."
+  (let ((text (error-message-string err)))
+    (unless (equal text point-history--last-error)
+      (setq point-history--last-error text)
+      (message "point-history: %s" text))))
+
+(defmacro point-history--catching-errors (&rest body)
+  "Run BODY and report any error instead of signaling it."
+  (declare (indent 0) (debug t))
+  `(condition-case err
+       (progn ,@body)
+     (error (point-history--report-error err))))
+
+(defvar point-history--pre-buffer nil
+  "The current buffer when the running command started.")
+
+(defvar point-history--pre-tick nil
+  "The character change tick of `point-history--pre-buffer'.")
+
+(defun point-history--pre-command ()
+  "Remember the buffer and its change tick before a command."
+  (point-history--catching-errors
+    (setq point-history--pre-buffer (current-buffer)
+          point-history--pre-tick (buffer-chars-modified-tick))))
+
+(defun point-history--command-activity-p ()
+  "Return non-nil if the command that just ran counts as activity.
+That is a copy command, or an edit command that changed the buffer it
+started in and ended there."
+  (or (memq this-command point-history-activity-commands)
+      (and (eq point-history--pre-buffer (current-buffer))
+           (not (eql point-history--pre-tick (buffer-chars-modified-tick)))
+           (not (memq this-command point-history-ignored-edit-commands)))))
+
+(defun point-history--post-command ()
+  "Record activity after a command if it was an edit or a copy."
+  (point-history--catching-errors
+    (when (and (point-history--command-activity-p)
+               (not (point-history--navigation-command-p this-command))
+               (eq (current-buffer) (window-buffer (selected-window)))
+               (point-history--recordable-p))
+      (point-history--activity 'activity))
+    (setq point-history--pre-buffer nil
+          point-history--pre-tick nil)))
+
+(defun point-history--idle ()
+  "Record reading at point of the selected window.
+Do nothing while navigating or if its buffer is not recordable."
+  (point-history--catching-errors
+    (let* ((window (selected-window))
+           (buffer (window-buffer window)))
+      (when (and (not point-history--navigating)
+                 (point-history--recordable-p buffer))
+        (with-current-buffer buffer
+          (save-excursion
+            (goto-char (window-point window))
+            (point-history--activity 'activity)))))))
+
+(defvar point-history--timer nil
+  "The idle timer that records reading, or nil.")
+
+(defun point-history--cancel-timer ()
+  "Cancel the idle timer if it is running."
+  (when point-history--timer
+    (cancel-timer point-history--timer)
+    (setq point-history--timer nil)))
+
 ;;;###autoload
 (define-minor-mode point-history-mode
   "Toggle recording of point history.
 When enabled, places of activity are recorded so that you can move
-back and forward through them."
+back and forward through them.  Disabling the mode keeps the
+history."
   :global t
   :group 'point-history
-  ;; Hooks and timers are added here by later tasks.
-  )
+  (point-history--cancel-timer)
+  (if point-history-mode
+      (progn
+        (add-hook 'pre-command-hook #'point-history--pre-command)
+        (add-hook 'post-command-hook #'point-history--post-command)
+        (when point-history-idle-delay
+          (setq point-history--timer
+                (run-with-idle-timer point-history-idle-delay t
+                                     #'point-history--idle))))
+    (remove-hook 'pre-command-hook #'point-history--pre-command)
+    (remove-hook 'post-command-hook #'point-history--post-command)))
 
 (provide 'point-history)
 ;;; point-history.el ends here
