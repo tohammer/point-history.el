@@ -64,3 +64,6 @@ The file is split into `;;;;` sections:
 - Batch Emacs does no redisplay: window-visibility tests stub
   `pos-visible-in-window-p`; tests drive commands by calling the pre-
   and post-command functions around the action with `this-command` bound.
+- Emacs 31 turned off checkdoc's imperative-verb check by default
+  (`checkdoc-verb-check-experimental-flag`), while 28 and 30 still run
+  it; the Makefile enables it so local runs match CI.

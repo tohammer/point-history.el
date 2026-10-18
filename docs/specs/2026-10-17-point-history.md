@@ -1,6 +1,6 @@
 # point-history: back/forward navigation by activity
 
-Status: approved
+Status: implemented
 Date: 2026-10-17
 
 ## Purpose
@@ -282,7 +282,7 @@ Manual checks in a real Emacs session with the suggested bindings:
 - [x] 7. README: behaviour, options, commands, suggested bindings,
   installation. *Done when* every option and command in the code is in
   the README and the README contains no private information.
-- [ ] 8. Publish: after the user confirms, create the public GitHub repo
+- [x] 8. Publish: after the user confirms, create the public GitHub repo
   `tohammer/point-history.el`, push `master` with the work, set up branch
   protection as described in `CLAUDE.md` (required checks
   `test (28.2)`, `test (30.2)`, `test (31.1)`). *Done when* CI is green
